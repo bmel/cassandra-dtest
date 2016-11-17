@@ -1,4 +1,5 @@
 import time
+import re
 from collections import namedtuple
 from distutils.version import LooseVersion
 
@@ -651,6 +652,66 @@ class TestAuth(Tester):
         rows = list(cathy.execute("TRUNCATE ks.cf"))
         self.assertItemsEqual(rows, [])
 
+    def modify_and_select_cols_auth_test(self):
+        """
+        * Launch a one node cluster
+        * Connect as the default superuser
+        * Create a new user, 'cathy', with no permissions
+        * Create table ks.cf
+        * Connect as cathy
+        * Asserting selecting from cf throws Unauthorized
+        * Assert granting SELECT on non-existing columns throws exception TODO
+        * Grant SELECT on certain columns to cathy, verify she can read them from cf
+        * Assert insert, update, delete, and truncate all throw Unauthorized
+        * Grant MODIFY on certain columns to cathy, verify she can now modify those columns
+        """
+        self.prepare()
+
+        cassandra = self.get_session(user='cassandra', password='cassandra')
+        cassandra.execute("CREATE USER cathy WITH PASSWORD '12345'")
+        cassandra.execute("CREATE KEYSPACE ks WITH replication = {'class':'SimpleStrategy', 'replication_factor':1}")
+        cassandra.execute("CREATE TABLE ks.cf (id int primary key, c1 text, c2 text, c3 text)")
+
+        cathy = self.get_session(user='cathy', password='12345')
+        assert_unauthorized(cathy, "SELECT * FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+
+        assert_invalid(cassandra, "GRANT SELECT(id, nevercol1, nevercol2) ON ks.cf TO cathy",
+                       re.escape("Error from server: code=2200 [Invalid query] message=\"Column(s) [nevercol1, nevercol2] do not exist in table <table ks.cf>\""))
+
+                       # re.escape("[nevercol1, nevercol2] do not exist in table"))
+
+        #assert_exception(cathy, "GRANT SELECT(id, nevercol1, nevercol2) ON ks.cf TO cathy", "TBD")
+
+        # TODO: enable
+
+        # assert_exception(cathy, "SELECT id, c1 FROM ks.cf", "User cathy has no SELECT permission on <TBD of table ks.cf> or any of its parents")
+        #
+        # cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
+        # rows = list(cathy.execute("SELECT * FROM ks.cf"))
+        # self.assertEquals(0, len(rows))
+
+        # TODO: adapt
+        # assert_unauthorized(cathy, "INSERT INTO ks.cf (id, val) VALUES (0, 0)", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
+        #
+        # assert_unauthorized(cathy, "UPDATE ks.cf SET val = 1 WHERE id = 1", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
+        #
+        # assert_unauthorized(cathy, "DELETE FROM ks.cf WHERE id = 1", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
+        #
+        # assert_unauthorized(cathy, "TRUNCATE ks.cf", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
+        #
+        # cassandra.execute("GRANT MODIFY ON ks.cf TO cathy")
+        # cathy.execute("INSERT INTO ks.cf (id, val) VALUES (0, 0)")
+        # cathy.execute("UPDATE ks.cf SET val = 1 WHERE id = 1")
+        # rows = list(cathy.execute("SELECT * FROM ks.cf"))
+        # self.assertEquals(2, len(rows))
+        #
+        # cathy.execute("DELETE FROM ks.cf WHERE id = 1")
+        # rows = list(cathy.execute("SELECT * FROM ks.cf"))
+        # self.assertEquals(1, len(rows))
+        #
+        # rows = list(cathy.execute("TRUNCATE ks.cf"))
+        # self.assertItemsEqual(rows, [])
+
     def grant_revoke_auth_test(self):
         """
         * Launch a one node cluster
@@ -1013,7 +1074,7 @@ class TestAuth(Tester):
         self.cluster.set_configuration_options(values=config)
         self.cluster.populate(nodes).start()
 
-        n = self.wait_for_any_log(self.cluster.nodelist(), 'Created default superuser', 25)
+        n = self.wait_for_any_log(self.cluster.nodelist(), 'Created default superuser', 160)
         debug("Default role created by " + n.name)
 
     def get_session(self, node_idx=0, user=None, password=None):
