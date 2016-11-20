@@ -678,17 +678,11 @@ class TestAuth(Tester):
         assert_invalid(cassandra, "GRANT SELECT(id, nevercol1, nevercol2) ON ks.cf TO cathy",
                        re.escape("Error from server: code=2200 [Invalid query] message=\"Column(s) [nevercol1, nevercol2] do not exist in table <table ks.cf>\""))
 
-                       # re.escape("[nevercol1, nevercol2] do not exist in table"))
+        assert_unauthorized(cathy, "SELECT id, c1 FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
 
-        #assert_exception(cathy, "GRANT SELECT(id, nevercol1, nevercol2) ON ks.cf TO cathy", "TBD")
+        cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
 
-        # TODO: enable
-
-        # assert_exception(cathy, "SELECT id, c1 FROM ks.cf", "User cathy has no SELECT permission on <TBD of table ks.cf> or any of its parents")
-        #
-        # cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
-        # rows = list(cathy.execute("SELECT * FROM ks.cf"))
-        # self.assertEquals(0, len(rows))
+        assert_unauthorized(cathy, "SELECT id, c2 FROM ks.cf", "User cathy has no SELECT permission on <TBD of table ks.cf> or any of its parents")
 
         # TODO: adapt
         # assert_unauthorized(cathy, "INSERT INTO ks.cf (id, val) VALUES (0, 0)", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
