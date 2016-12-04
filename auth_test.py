@@ -660,7 +660,7 @@ class TestAuth(Tester):
         * Create table ks.cf
         * Connect as cathy
         * Asserting selecting from cf throws Unauthorized
-        * Assert granting SELECT on non-existing columns throws exception TODO
+        * Assert granting SELECT on non-existing columns throws exception
         * Grant SELECT on certain columns to cathy, verify she can read them from cf
         * Assert insert, update, delete, and truncate all throw Unauthorized
         * Grant MODIFY on certain columns to cathy, verify she can now modify those columns
@@ -668,43 +668,54 @@ class TestAuth(Tester):
         self.prepare()
 
         cassandra = self.get_session(user='cassandra', password='cassandra')
+
+        # Create and logon user
         cassandra.execute("CREATE USER cathy WITH PASSWORD '12345'")
+        cathy = self.get_session(user='cathy', password='12345')
+
+        # Create table
         cassandra.execute("CREATE KEYSPACE ks WITH replication = {'class':'SimpleStrategy', 'replication_factor':1}")
         cassandra.execute("CREATE TABLE ks.cf (id int primary key, c1 text, c2 text, c3 text)")
 
-        cathy = self.get_session(user='cathy', password='12345')
+        # By default, the user has no permission on this table:
         assert_unauthorized(cathy, "SELECT * FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
 
+        # Test invalid GRANT statements and whether the correct errors are returned:
+
         assert_invalid(cassandra, "GRANT SELECT(id, nevercol1, nevercol2) ON ks.cf TO cathy",
-                       re.escape("Error from server: code=2200 [Invalid query] message=\"Column(s) [nevercol1, nevercol2] do not exist in table <table ks.cf>\""))
+                       re.escape("Error from server: code=2200 [Invalid query] message=\"Column(s) [nevercol2, nevercol1] do not exist in <table ks.cf>\""))
+
+        assert_invalid(cassandra, "GRANT SELECT(id, nevercol1, nevercol2) ON cf TO cathy",
+                       re.escape("Error from server: code=2200 [Invalid query] message=\"No keyspace has been specified. USE a keyspace, or explicitly specify keyspace.tablename\""))
+
+        assert_exception(cassandra, "GRANT DROP(id) ON ks.cf TO cathy", # Permission constraints are not applicable except on SELECT and MODIFY
+                         re.escape("Error from server: code=2000 [Syntax error in CQL query]"),
+                         expected=SyntaxException)
+
 
         assert_unauthorized(cathy, "SELECT id, c1 FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
 
+        # Grant permission on certain columns and verify that only those columns can be queried:
         cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
+        cathy.execute("SELECT id, c1 FROM ks.cf")
+        assert_unauthorized(cathy, "SELECT id, c2 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {c2} of <table ks.cf>"))
 
-        assert_unauthorized(cathy, "SELECT id, c2 FROM ks.cf", "User cathy has no SELECT permission on <TBD of table ks.cf> or any of its parents")
+        # Grant SELECT permission without a column constraint, verify that all columns can be selected, even those where permissions were NOT granted above:
+        cassandra.execute("GRANT SELECT ON ks.cf TO cathy")
+        cathy.execute("SELECT id, c1, c2 FROM ks.cf")
+        cathy.execute("SELECT * FROM ks.cf")
 
-        # TODO: adapt
-        # assert_unauthorized(cathy, "INSERT INTO ks.cf (id, val) VALUES (0, 0)", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
-        #
-        # assert_unauthorized(cathy, "UPDATE ks.cf SET val = 1 WHERE id = 1", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
-        #
-        # assert_unauthorized(cathy, "DELETE FROM ks.cf WHERE id = 1", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
-        #
-        # assert_unauthorized(cathy, "TRUNCATE ks.cf", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
-        #
-        # cassandra.execute("GRANT MODIFY ON ks.cf TO cathy")
-        # cathy.execute("INSERT INTO ks.cf (id, val) VALUES (0, 0)")
-        # cathy.execute("UPDATE ks.cf SET val = 1 WHERE id = 1")
-        # rows = list(cathy.execute("SELECT * FROM ks.cf"))
-        # self.assertEquals(2, len(rows))
-        #
-        # cathy.execute("DELETE FROM ks.cf WHERE id = 1")
-        # rows = list(cathy.execute("SELECT * FROM ks.cf"))
-        # self.assertEquals(1, len(rows))
-        #
-        # rows = list(cathy.execute("TRUNCATE ks.cf"))
-        # self.assertItemsEqual(rows, [])
+        # Again, constrain the SELECT permission to certain columns and verify that only those columns can be queried:
+        cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
+        cathy.execute("SELECT id, c1 FROM ks.cf")
+        assert_unauthorized(cathy, "SELECT id, c2 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {c2} of <table ks.cf>"))
+
+        # Revoke SELECT permission altogether, verify that the table cannot be queried, not even for the column(s) explicitly granted before:
+        cassandra.execute("REVOKE SELECT ON ks.cf FROM cathy")
+        assert_unauthorized(cathy, "SELECT id FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+
+
+        # TODO: ...
 
     def grant_revoke_auth_test(self):
         """
