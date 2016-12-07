@@ -1,4 +1,5 @@
 import time
+import re
 from collections import namedtuple
 from distutils.version import LooseVersion
 
@@ -650,6 +651,168 @@ class TestAuth(Tester):
 
         rows = list(cathy.execute("TRUNCATE ks.cf"))
         self.assertItemsEqual(rows, [])
+
+    def modify_and_select_cols_auth_test(self):
+        """
+        * SETUP
+        * Launch a one node cluster
+        * Connect as the default superuser
+        * Create a new users, 'cathy' and 'tom', with no permissions
+        * Create tables ks.cf and cf2
+        * Create roles
+        *
+        * TESTS (high-level plan)
+        * Assert that illegal or inapplicable GRANT with column constraints throws exceptions
+        * Verify SELECT permissions with column constraints
+        * Verify MODIFY permissions with column constraints (INSERT, UPDATE, DELETE, TRUNCATE)
+        * Verify that permission propagation works with role assignments and through resource hierarchies
+        * Verify with views
+        * Check column names with differing case and special chars
+        * Check that dropping columns from table definition (ALTER TABLE ks.t1 DROP c1, c2)
+        *    removes those columns from any constraints on their table,
+        *    for good housekeeping and for preventing accidental leakage of permissions,
+        *    should new columns be created with names of previously dropped ones.
+        """
+
+        ######################
+        # SETUP
+
+        self.prepare()
+
+        cassandra = self.get_session(user='cassandra', password='cassandra')
+
+        # Create and logon user
+        cassandra.execute("CREATE USER cathy WITH PASSWORD '12345'")
+        cathy = self.get_session(user='cathy', password='12345')
+        cassandra.execute("CREATE USER tom WITH PASSWORD '12345'")
+        tom = self.get_session(user='tom', password='12345')
+
+        # Create roles
+        cassandra.execute("CREATE ROLE IF NOT EXISTS role1")
+        cassandra.execute("CREATE ROLE IF NOT EXISTS role2")
+
+        # Create tables
+        cassandra.execute("CREATE KEYSPACE ks WITH replication = {'class':'SimpleStrategy', 'replication_factor':1}")
+        cassandra.execute("CREATE TABLE ks.cf (id int primary key, c1 text, c2 text, c3 text)")
+        cassandra.execute("CREATE TABLE ks.cf2 (id int primary key, c1 text, c2 text, c3 text)")
+
+        # By default, the user has no permission on this table:
+        assert_unauthorized(cathy, "SELECT * FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+
+        ######################
+        # GRANT
+        # Test invalid GRANT statements and whether the correct errors are returned:
+
+        assert_invalid(cassandra, "GRANT SELECT(id, nevercol1, nevercol2) ON ks.cf TO cathy",
+                       re.escape("Error from server: code=2200 [Invalid query] message=\"Column(s) [nevercol2, nevercol1] do not exist in <table ks.cf>\""))
+
+        assert_invalid(cassandra, "GRANT SELECT(id, nevercol1, nevercol2) ON cf TO cathy",
+                       re.escape("Error from server: code=2200 [Invalid query] message=\"No keyspace has been specified. USE a keyspace, or explicitly specify keyspace.tablename\""))
+        # Permission constraints are not applicable except on SELECT and MODIFY:
+        assert_exception(cassandra, "GRANT DROP(id) ON ks.cf TO cathy",
+                         re.escape("Error from server: code=2000 [Syntax error in CQL query]"),
+                         expected=SyntaxException)
+        assert_exception(cassandra, "GRANT DESCRIBE(id) ON ALL ROLES TO cathy",
+                         re.escape("Error from server: code=2000 [Syntax error in CQL query]"),
+                         expected=SyntaxException)
+
+
+        ######################
+        # SELECT
+        assert_unauthorized(cathy, "SELECT id, c1 FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+
+        # Grant permission on certain columns and verify that only those columns can be queried, and only by the user with the permissions:
+        cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
+        cathy.execute("SELECT id, c1 FROM ks.cf")
+        assert_unauthorized(cathy, "SELECT id, c2 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {c2} of <table ks.cf>"))
+        assert_unauthorized(tom, "SELECT id, c1 FROM ks.cf", "User tom has no SELECT permission on <table ks.cf> or any of its parents")
+        assert_unauthorized(cathy, "SELECT id, c1 FROM ks.cf2", "User cathy has no SELECT permission on <table ks.cf2> or any of its parents")
+
+        # Grant SELECT permission without a column constraint, verify that all columns can be selected, even those where permissions were NOT granted above:
+        cassandra.execute("GRANT SELECT ON ks.cf TO cathy")
+        cathy.execute("SELECT id, c1, c2 FROM ks.cf")
+        cathy.execute("SELECT * FROM ks.cf")
+
+        # Again, constrain the SELECT permission to certain columns and verify that only those columns can be queried:
+        cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
+        cathy.execute("SELECT id, c1 FROM ks.cf")
+        assert_unauthorized(cathy, "SELECT id, c2 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {c2} of <table ks.cf>"))
+
+        # Add c2, verify that granting is additive:
+        cassandra.execute("GRANT SELECT(c2) ON ks.cf TO cathy")
+        cathy.execute("SELECT id, c1, c2 FROM ks.cf")
+        assert_unauthorized(cathy, "SELECT id, c2, c3 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {c3} of <table ks.cf>"))
+
+        # Revoke SELECT permission altogether, verify that the table cannot be queried, not even for the column(s) explicitly granted before:
+        cassandra.execute("REVOKE SELECT ON ks.cf FROM cathy")
+        assert_unauthorized(cathy, "SELECT id FROM ks.cf", "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+
+        # Grant SELECT on one column and verify that the column previously included cannot be accessed,
+        # meaning it did not leak, thanks to properly getting purged following the above REVOKE.
+        cassandra.execute("GRANT SELECT(id) ON ks.cf TO cathy")
+        cathy.execute("SELECT id FROM ks.cf")
+        assert_unauthorized(cathy, "SELECT id, c1 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {c1} of <table ks.cf>"))
+
+        ######################
+        # MODIFY: INSERT, UPDATE, DELETE, TRUNCATE
+        # Make sure SELECT permissions don't leak into MODIFY permissions:
+        cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
+
+        # Before granting MODIFY permissions
+        assert_unauthorized(cathy, "INSERT INTO ks.cf (id, c1) VALUES (1, 'A')", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
+        assert_unauthorized(cathy, "INSERT INTO ks.cf JSON '{\"id\":1, \"c1\":\"A\"}'", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
+        assert_unauthorized(cathy, "UPDATE ks.cf SET c1='B' WHERE id=1", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
+        assert_unauthorized(cathy, "DELETE c1 FROM ks.cf WHERE id=1", "User cathy has no MODIFY permission on <table ks.cf> or any of its parents")
+
+        cassandra.execute("GRANT MODIFY(id, c1) ON ks.cf TO cathy")
+
+        # After granting permissions, check that cathy has access to the allowed column, but not to an non-allowed one
+        # INSERT
+        cathy.execute("INSERT INTO ks.cf (id, c1) VALUES (1, 'A')")
+        assert_unauthorized(cathy, "INSERT INTO ks.cf (id, c2) VALUES (2, 'A')", re.escape("User cathy has no MODIFY permission on column(s) {c2} of <table ks.cf>"))
+        # INSERT via JSON - disabled, since at the time of this writing, JSON-wise INSERTs list all the columns as 'updated', regardless of which ones are actually set
+        fixedInsertViaJson = False
+        if fixedInsertViaJson:
+            cathy.execute("INSERT INTO ks.cf JSON '{\"id\":1, \"c1\":\"A\"}'")
+            assert_unauthorized(cathy, "INSERT INTO ks.cf JSON '{\"id\":1, \"c2\":\"A\"}'", re.escape("User cathy has no MODIFY permission on column(s) {c2} of <table ks.cf>"))
+        # UPDATE
+        cathy.execute("UPDATE ks.cf SET c1='B' WHERE id=1")
+        assert_unauthorized(cathy, "UPDATE ks.cf SET c2='B' WHERE id=1", re.escape("User cathy has no MODIFY permission on column(s) {c2} of <table ks.cf>"))
+        # DELETE a certain column
+        cathy.execute("DELETE c1 FROM ks.cf WHERE id=1")
+        assert_unauthorized(cathy, "DELETE c2 FROM ks.cf WHERE id=1", re.escape("User cathy has no MODIFY permission on column(s) {c2} of <table ks.cf>"))
+
+        # UPDATE/DELETE also require SELECT permissions on columns referenced in IF conditions, if any:
+        # With no SELECT permissions at all:
+        cassandra.execute("REVOKE SELECT ON ks.cf FROM cathy")
+        assert_unauthorized(cathy, "UPDATE ks.cf SET c1='B' WHERE id=1 IF c3='x'", re.escape("User cathy has no SELECT permission on <table ks.cf> or any of its parents"))
+        assert_unauthorized(cathy, "DELETE c1 FROM ks.cf WHERE id=1 IF c3='x'", re.escape("User cathy has no SELECT permission on <table ks.cf> or any of its parents"))
+        # With SELECT permissions, but not on the referenced column:
+        cassandra.execute("GRANT SELECT(id) ON ks.cf TO cathy")
+        assert_unauthorized(cathy, "UPDATE ks.cf SET c1='B' WHERE id=1 IF c3='x'", re.escape("User cathy has no SELECT permission on column(s) {c3} of <table ks.cf>"))
+        assert_unauthorized(cathy, "DELETE c1 FROM ks.cf WHERE id=1 IF c3='x'", re.escape("User cathy has no SELECT permission on column(s) {c3} of <table ks.cf>"))
+        # With SELECT permissions including the referenced column:
+        cassandra.execute("GRANT SELECT(c3) ON ks.cf TO cathy")
+        cathy.execute("UPDATE ks.cf SET c1='B' WHERE id=1 IF c3='x'")
+        cathy.execute("DELETE c1 FROM ks.cf WHERE id=1 IF c3='x'")
+
+        # DELETE whole rows and TRUNCATE require permissions to all the columns of a table:
+        assert_unauthorized(cathy, "DELETE FROM ks.cf WHERE id=1", re.escape("User cathy has no MODIFY permission on column(s) {c2, c3} of <table ks.cf>"))
+        assert_unauthorized(cathy, "TRUNCATE ks.cf", re.escape("User cathy has no MODIFY permission on column(s) {c2, c3} of <table ks.cf>"))
+        cassandra.execute("GRANT MODIFY(c2, c3) ON ks.cf TO cathy")
+        cathy.execute("DELETE FROM ks.cf WHERE id=1")
+        cathy.execute("TRUNCATE ks.cf")
+
+        # With MODIFY granted on all columns, INSERT via JSON works even before the fix:
+        cathy.execute("INSERT INTO ks.cf JSON '{\"id\":1, \"c1\":\"A\"}'")
+
+        # Verify that permissions of one user don't affect other users:
+        assert_unauthorized(tom, "INSERT INTO ks.cf (id, c1) VALUES (3, 'A')", "User tom has no MODIFY permission on <table ks.cf> or any of its parents")
+
+        # TODO: ...
+        # Verify that permission propagation works with role assignments and through resource hierarchies
+        # Verify with views
+        # Check column names with differing case and special chars
 
     def grant_revoke_auth_test(self):
         """
