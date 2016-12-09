@@ -809,10 +809,45 @@ class TestAuth(Tester):
         # Verify that permissions of one user don't affect other users:
         assert_unauthorized(tom, "INSERT INTO ks.cf (id, c1) VALUES (3, 'A')", "User tom has no MODIFY permission on <table ks.cf> or any of its parents")
 
-        # TODO: ...
+        ########################################################
         # Verify that permission propagation works with role assignments and through resource hierarchies
+        # Start without permissions, create role 'member' and grant it to cathy:
+        cassandra.execute("REVOKE SELECT ON ks.cf FROM cathy")
+        cassandra.execute("CREATE ROLE member")
+        cassandra.execute("GRANT member TO cathy")
+        assert_unauthorized(cathy, "SELECT id FROM ks.cf", re.escape("User cathy has no SELECT permission on <table ks.cf> or any of its parents"))
+        # Grant SELECT column permission to role 'member' and verify that cathy has access:
+        cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO member")
+        time.sleep(2.0) # For some reason, permissions seem to be cached although self.prepare() is called with default permissions_validity=0
+        cathy.execute("SELECT id, c1 FROM ks.cf")
+        # Check that this permission is not leaking to other users, tables, or columns:
+        assert_unauthorized(tom, "SELECT id, c1 FROM ks.cf", "User tom has no SELECT permission on <table ks.cf> or any of its parents")
+        assert_unauthorized(cathy, "SELECT id, c1 FROM ks.cf2", "User cathy has no SELECT permission on <table ks.cf2> or any of its parents")
+        # Role 'member' does not have access to c2, and so cathy does not have it either:
+        assert_unauthorized(cathy, "SELECT id, c1, c2 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {c2} of <table ks.cf>"))
+        # Grant just c2 to cathy and verify that the column permissions are adding up for her: member=(id,c1), cathy=(c2):
+        cassandra.execute("GRANT SELECT(c2) ON ks.cf TO cathy")
+        cathy.execute("SELECT id, c1, c2 FROM ks.cf")
+
+        # Revoke the role and verify that cathy has no access anymore:
+        cassandra.execute("REVOKE member FROM cathy")
+        time.sleep(2.0)
+        assert_unauthorized(cathy, "SELECT id FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {id} of <table ks.cf>"))
+
+        # TODO: resource hierarchies
+
+        # TODO:
+        #############################
         # Verify with views
+
+        ################################
         # Check column names with differing case and special chars
+
+        ########################################################
+        # Check that dropping columns from table definition (ALTER TABLE ks.t1 DROP c1, c2)
+        #    removes those columns from any constraints on their table,
+        #    for good housekeeping and for preventing accidental leakage of permissions,
+        #    should new columns be created with names of previously dropped ones.
 
     def grant_revoke_auth_test(self):
         """
