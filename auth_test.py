@@ -891,14 +891,46 @@ class TestAuth(Tester):
         cathy.execute(mixedCaseQueryWithC2)
         cathy.execute("SELECT * FROM kS.Cf")
 
+        cassandra.execute("DROP MATERIALIZED VIEW ks.mv")
+
         ######################################################################
         # Check column names with special chars
+        cassandra.execute("CREATE TABLE ks.cfs (\"#num #\" int primary key, \"c1, +=\" text, \"c2, '\" text)")
+        specialCharsQuery = "SELECT \"#num #\", \"c1, +=\" FROM ks.cfs"
+        assert_unauthorized(cathy, specialCharsQuery, "User cathy has no SELECT permission on <table ks.cfs> or any of its parents")
+
+        # Grant permission on certain columns and verify that only those columns can be queried, and only by the user with the permissions:
+        cassandra.execute("GRANT SELECT(\"#num #\", \"c1, +=\") ON ks.cfs TO cathy")
+        cathy.execute(specialCharsQuery)
+        specialCharsQueryWithC2 = "SELECT \"#num #\", \"c1, +=\", \"c2, '\" FROM ks.cfs"
+        assert_unauthorized(cathy, specialCharsQueryWithC2, re.escape("User cathy has no SELECT permission on column(s) {c2, '} of <table ks.cfs>"))
+
+        # Grant SELECT permission without a column constraint, verify that all columns can be selected, even those where permissions were NOT granted above:
+        cassandra.execute("GRANT SELECT ON ks.cfs TO cathy")
+        cathy.execute(specialCharsQueryWithC2)
+        cathy.execute("SELECT * FROM ks.cfs")
 
         ########################################################
-        # Check that dropping columns from table definition (ALTER TABLE ks.t1 DROP c1, c2)
+        # Check that dropping columns from table definition (ALTER TABLE ks.cf DROP c1, c2)
         #    removes those columns from any constraints on their table,
         #    for good housekeeping and for preventing accidental leakage of permissions,
         #    should new columns be created with names of previously dropped ones.
+        cassandra.execute("REVOKE SELECT ON ks.cf FROM cathy")
+        query = "SELECT id, c1 FROM ks.cf"
+        assert_unauthorized(cathy, mixedCaseQuery, "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+        cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
+        cathy.execute(query)
+
+        cassandra.execute("ALTER TABLE ks.cf DROP c1")
+        assert_invalid(cassandra, query, "Undefined column name c1")  # verify that c1 is gone
+
+        # create a new column, with name 'c1', for which permission was granted to cathy, before getting dropped:
+        cassandra.execute("ALTER TABLE ks.cf ADD c1 text")
+        cassandra.execute(query)  # Verify that the new c1 exists
+
+        # Cathy's access to c1 should fail, or else it means the column permissions has leaked for the re-created c1:
+        assert_unauthorized(cathy, query, "tbd")
+
 
     def grant_revoke_auth_test(self):
         """
