@@ -677,7 +677,7 @@ class TestAuth(Tester):
         ######################
         # SETUP
 
-        self.prepare()
+        self.prepare(roles_expiry=0)
 
         cassandra = self.get_session(user='cassandra', password='cassandra')
 
@@ -816,32 +816,83 @@ class TestAuth(Tester):
         cassandra.execute("CREATE ROLE member")
         cassandra.execute("GRANT member TO cathy")
         assert_unauthorized(cathy, "SELECT id FROM ks.cf", re.escape("User cathy has no SELECT permission on <table ks.cf> or any of its parents"))
+
         # Grant SELECT column permission to role 'member' and verify that cathy has access:
         cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO member")
-        time.sleep(2.0) # For some reason, permissions seem to be cached although self.prepare() is called with default permissions_validity=0
         cathy.execute("SELECT id, c1 FROM ks.cf")
+
         # Check that this permission is not leaking to other users, tables, or columns:
         assert_unauthorized(tom, "SELECT id, c1 FROM ks.cf", "User tom has no SELECT permission on <table ks.cf> or any of its parents")
         assert_unauthorized(cathy, "SELECT id, c1 FROM ks.cf2", "User cathy has no SELECT permission on <table ks.cf2> or any of its parents")
+
         # Role 'member' does not have access to c2, and so cathy does not have it either:
         assert_unauthorized(cathy, "SELECT id, c1, c2 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {c2} of <table ks.cf>"))
+
         # Grant just c2 to cathy and verify that the column permissions are adding up for her: member=(id,c1), cathy=(c2):
         cassandra.execute("GRANT SELECT(c2) ON ks.cf TO cathy")
         cathy.execute("SELECT id, c1, c2 FROM ks.cf")
 
-        # Revoke the role and verify that cathy has no access anymore:
+        # Revoke the role and verify that cathy has no access to {id, c1} anymore (though she retains access to c2:
         cassandra.execute("REVOKE member FROM cathy")
-        time.sleep(2.0)
-        assert_unauthorized(cathy, "SELECT id FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {id} of <table ks.cf>"))
+        assert_unauthorized(cathy, "SELECT id, c1, c2 FROM ks.cf", re.escape("User cathy has no SELECT permission on column(s) {id, c1} of <table ks.cf>"))
 
-        # TODO: resource hierarchies
+        # Keyspace override: Grant permission on keyspace to cathy, verify that she has access to all of the columns:
+        cassandra.execute("GRANT SELECT ON KEYSPACE ks TO cathy")
+        cathy.execute("SELECT id, c1, c2 FROM ks.cf")
+        cathy.execute("SELECT * FROM ks.cf")
 
-        # TODO:
         #############################
         # Verify with views
+        cassandra.execute("REVOKE SELECT ON KEYSPACE ks FROM cathy")
+        cassandra.execute("""
+            CREATE MATERIALIZED VIEW ks.mv AS
+                SELECT * FROM ks.cf
+                WHERE c1 IS NOT NULL
+                PRIMARY KEY (id, c1)
+                WITH comment='Allow query by c1 instead of id';
+        """)
+        assert_unauthorized(cathy, "SELECT id, c1 FROM ks.mv", re.escape("User cathy has no SELECT permission on column(s) {id, c1} of <table ks.cf>"))
+        cassandra.execute("GRANT SELECT(id, c1) ON ks.cf TO cathy")
 
-        ################################
-        # Check column names with differing case and special chars
+        # TODO: Why are no permissions needed on mv?
+        cathy.execute("SELECT id, c1 FROM ks.mv")
+
+        assert_unauthorized(cathy, "UPDATE ks.mv SET c2='B' WHERE id=1 AND c1='A'", "User cathy has no MODIFY permission on <table ks.mv> or any of its parents")
+        cassandra.execute("GRANT MODIFY(id, c1, c2, c3) ON ks.mv TO cathy")
+        # Unfortunate that permissions are checked for an invalid query, but this is how we know that the permission was indeed granted:
+        assert_invalid(cathy, "UPDATE ks.mv SET c3='B' WHERE id=1 AND c1='A'", "Cannot directly modify a materialized view")
+
+        assert_unauthorized(cathy, "UPDATE ks.mv SET c2='B' WHERE id=1 AND c1='A' IF c2='C'", "User cathy has no SELECT permission on <table ks.mv> or any of its parents")
+        cassandra.execute("GRANT SELECT(c2) ON ks.mv TO cathy")  #  for the IF condition
+        # Unfortunate that permissions are checked for an invalid query, but this is how we know that the permission was indeed granted:
+        assert_invalid(cathy, "UPDATE ks.mv SET c3='B' WHERE id=1 AND c1='A' IF c2='C'", "Cannot directly modify a materialized view")
+
+        assert_unauthorized(cathy, "UPDATE ks.cf SET c3='B' WHERE id=1 IF c2='C'", re.escape("User cathy has no SELECT permission on column(s) {c3} of <table ks.cf>"))
+        cassandra.execute("GRANT SELECT(c3) ON ks.cf TO cathy")
+        cathy.execute("UPDATE ks.cf SET c3='B' WHERE id=1 IF c2='C'")
+
+        cassandra.execute("REVOKE MODIFY ON ks.mv FROM cathy")
+        assert_unauthorized(cathy, "UPDATE ks.cf SET c3='B' WHERE id=1 IF c2='C'", "User cathy has no MODIFY permission on <table ks.mv> or any of its parents")
+
+        ######################################################################
+        # Check column names with differing case
+        cassandra.execute("REVOKE SELECT ON ks.cf FROM cathy")
+        mixedCaseQuery = "SELECT iD, C1 FROM kS.Cf"
+        assert_unauthorized(cathy, mixedCaseQuery, "User cathy has no SELECT permission on <table ks.cf> or any of its parents")
+
+        # Grant permission on certain columns and verify that only those columns can be queried, and only by the user with the permissions:
+        cassandra.execute("GRANT SELECT(Id, c1) ON Ks.cF TO cathy")
+        cathy.execute(mixedCaseQuery)
+        mixedCaseQueryWithC2 = "SELECT iD, C1, C2 FROM kS.Cf"
+        assert_unauthorized(cathy, mixedCaseQueryWithC2, re.escape("User cathy has no SELECT permission on column(s) {c2} of <table ks.cf>"))
+
+        # Grant SELECT permission without a column constraint, verify that all columns can be selected, even those where permissions were NOT granted above:
+        cassandra.execute("GRANT SELECT ON Ks.cF TO cathy")
+        cathy.execute(mixedCaseQueryWithC2)
+        cathy.execute("SELECT * FROM kS.Cf")
+
+        ######################################################################
+        # Check column names with special chars
 
         ########################################################
         # Check that dropping columns from table definition (ALTER TABLE ks.t1 DROP c1, c2)
@@ -1199,15 +1250,17 @@ class TestAuth(Tester):
             self.assertGreater(success, 0)
             self.assertGreater(failure, 0)
 
-    def prepare(self, nodes=1, permissions_validity=0):
+    def prepare(self, nodes=1, permissions_validity=0, roles_expiry=2000):
         """
         Sets up and launches C* cluster.
         @param nodes Number of nodes in the cluster. Default is 1
         @param permissions_validity The timeout for the permissions cache in ms. Default is 0.
+        @param roles_expiry The timeout for the permissions cache in ms. Default is 2000.
         """
         config = {'authenticator': 'org.apache.cassandra.auth.PasswordAuthenticator',
                   'authorizer': 'org.apache.cassandra.auth.CassandraAuthorizer',
-                  'permissions_validity_in_ms': permissions_validity}
+                  'permissions_validity_in_ms': permissions_validity,
+                  'roles_validity_in_ms': roles_expiry}
         self.cluster.set_configuration_options(values=config)
         self.cluster.populate(nodes).start()
 
